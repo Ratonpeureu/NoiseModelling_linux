@@ -1,0 +1,179 @@
+name: Reusable Linux Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      git_ref:
+        description: 'The git ref to checkout'
+        required: true
+        type: string
+      use_snapshots:
+        description: 'Enable the Maven profile use-snapshots (set false to disable - used for releases)'
+        required: false
+        type: boolean
+        default: true
+      run_unit_tests:
+        description: 'Run Maven unit tests'
+        required: false
+        type: boolean
+        default: true
+  workflow_call:
+    inputs:
+      git_ref:
+        description: 'The git ref to checkout'
+        required: true
+        type: string
+      use_snapshots:
+        description: 'Enable the Maven profile use-snapshots (set false to disable - used for releases)'
+        required: false
+        type: boolean
+        default: true
+      run_unit_tests:
+        description: 'Run Maven unit tests'
+        required: false
+        type: boolean
+        default: true
+    outputs:
+      # Tier 3: Map Workflow Output -> Job Output
+      installer_name:
+        description: "The filename of the generated .deb package"
+        value: ${{ jobs.build.outputs.package_name }} # MUST reference jobs, not steps
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      package_name: ${{ steps.version_step.outputs.PACKAGE_NAME }}
+    steps:
+      # Checkout the source code of the project
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git_ref }}
+
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2/
+          key: ${{ runner.os }}-${{ hashFiles('**/lockfiles') }}
+
+      # Set up the jdk using version 25 of Adoptium Temurin
+      - name: Setup java 25 using Adoptium Temurin
+        uses: actions/setup-java@v6
+        with:
+          distribution: 'temurin'
+          java-version: '25'
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Building
+        shell: bash
+        env:
+          MAVEN_PROFILE: ${{ inputs.use_snapshots && '-Puse-snapshots' || '' }}
+          # If run_unit_tests is false, add the skip flag
+          SKIP_TESTS: ${{ inputs.run_unit_tests == false && '-DskipTests' || '' }}
+        run: |
+          # Note: 'install' automatically runs tests unless -DskipTests is provided
+          mvn install javadoc:test-javadoc javadoc:jar package -B $MAVEN_PROFILE $SKIP_TESTS
+
+      - name: Extract packaged zip
+        run: |
+          unzip -o noisemodelling-scripts/target/*.zip -d NoiseModelling
+
+      - name: Find extracted folder (bash)
+        id: folder
+        run: |
+          SUBDIR=$(find NoiseModelling -mindepth 1 -maxdepth 1 -type d | head -n 1)
+          echo "folder=$SUBDIR" >> "$GITHUB_OUTPUT"
+
+      - name: Integration test, use ScriptRunner to import a shapefile into the database
+        run: |
+          chmod +x ./bin/ScriptRunner
+          ./bin/ScriptRunner -w ./ -s scripts/Import_and_Export/Import_File.groovy --pathFile resources/ground_type.shp
+        working-directory: ${{ steps.folder.outputs.folder }}
+
+      - name: Fetch versions for Linux package metadata
+        id: version_step
+        run: |
+          MAVEN_VERSION=$(grep -m1 -oP '(?<=<version>)[^<]+' pom.xml)
+          echo "MAVEN_VERSION=$MAVEN_VERSION" >> "$GITHUB_ENV"
+          echo "PACKAGE_NAME=noisemodelling_${MAVEN_VERSION}_amd64.deb" >> "$GITHUB_OUTPUT"
+          # Keep a human-readable version string in env
+          echo "APP_VERSION_TXT=$MAVEN_VERSION" >> "$GITHUB_ENV"
+
+      - name: Extract NoiseModelling packaged ZIP into app folder
+        run: |
+          ZIP=$(find noisemodelling-scripts/target -name '*.zip' | head -n 1)
+          mkdir -p extracted_raw installer/app
+          unzip -o "$ZIP" -d extracted_raw
+          INNER_DIR=$(find extracted_raw -mindepth 1 -maxdepth 1 -type d | head -n 1)
+          cp -r "$INNER_DIR"/. installer/app/
+
+      - name: Debug unzipped contents
+        run: |
+          ls -la installer
+          ls -la installer/app/bin
+
+      - name: Download Linux JRE (Adoptium)
+        run: |
+          JRE_URL="https://api.adoptium.net/v3/binary/latest/25/ga/linux/x64/jre/hotspot/normal/eclipse"
+          curl -fsSL -o jre.tar.gz "$JRE_URL"
+          mkdir -p jre_raw
+          tar -xzf jre.tar.gz -C jre_raw
+          INNER_JRE=$(find jre_raw -mindepth 1 -maxdepth 1 -type d | head -n 1)
+          mv "$INNER_JRE" installer/jre
+
+      - name: Build .deb package
+        run: |
+          mkdir -p pkg/DEBIAN
+          mkdir -p pkg/opt/noisemodelling
+          mkdir -p pkg/usr/bin
+
+          # Install app + JRE under /opt/noisemodelling
+          cp -r installer/app/. pkg/opt/noisemodelling/
+          cp -r installer/jre   pkg/opt/noisemodelling/jre
+
+          # Wrapper launcher (quoted heredoc → no variable expansion)
+          cat > pkg/usr/bin/noisemodelling << 'EOF'
+          #!/bin/sh
+          HERE=/opt/noisemodelling
+          export JAVA_HOME="$HERE/jre"
+          export PATH="$JAVA_HOME/bin:$HERE/bin:$PATH"
+          exec "$HERE/bin/ScriptRunner" "$@"
+          EOF
+          chmod 0755 pkg/usr/bin/noisemodelling
+
+          # Debian control file (unquoted heredoc → $MAVEN_VERSION is expanded)
+          cat > pkg/DEBIAN/control << EOF
+          Package: noisemodelling
+          Version: $MAVEN_VERSION
+          Section: science
+          Priority: optional
+          Architecture: amd64
+          Maintainer: NoiseModelling Team <noreply@example.com>
+          Description: NoiseModelling
+           NoiseModelling environmental noise modelling tool with bundled JRE (Adoptium 25).
+          EOF
+
+          # Build the .deb
+          dpkg-deb --build pkg "installer/$PACKAGE_NAME"
+
+      - name: Build portable tarball
+        run: |
+          mkdir -p dist/noisemodelling-${MAVEN_VERSION}
+          cp -r installer/app/. dist/noisemodelling-${MAVEN_VERSION}/
+          cp -r installer/jre   dist/noisemodelling-${MAVEN_VERSION}/jre
+          tar -czf "installer/noisemodelling-${MAVEN_VERSION}-linux-x64.tar.gz" \
+            -C dist "noisemodelling-${MAVEN_VERSION}"
+
+      - name: Upload Installer Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-installer
+          path: |
+            installer/${{ env.MAVEN_VERSION }}_amd64.deb
+            installer/noisemodelling-${{ env.MAVEN_VERSION }}-linux-x64.tar.gz
